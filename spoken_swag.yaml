@@ -1,0 +1,17 @@
+# SpokenSwag DPO dataset for Moshi.
+# https://huggingface.co/datasets/slprl/SpokenSwag
+
+repo_id: slprl/SpokenSwag
+cache_dir: null
+num_proc: 4
+
+# Moshi / Mimi expect 24 kHz input.
+sampling_rate: 24000
+
+# Optional repetition filter (uses the dataset's own auto_bleu2 column).
+repetition_filter: false
+max_auto_bleu: 0.3
+
+# Optional truncation for smoke tests; null = full split.
+train_take: null
+val_take: null
