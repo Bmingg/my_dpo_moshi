@@ -56,7 +56,7 @@ def load_spoken_swag(
     *,
     sampling_rate: int = 24000,
 ) -> DatasetDict:
-    """Load the SpokenSwag DPO dataset, ready for Moshi.
+    """Load the SpokenSwag DPO dataset.
 
     Args:
         cfg: a Hydra config (see `config/data/spoken_swag.yaml`). Recognised
