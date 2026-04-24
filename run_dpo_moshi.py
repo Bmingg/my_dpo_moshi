@@ -168,6 +168,24 @@ def main():
     for split, d in ds.items():
         logger.info("  %s: %d examples", split, len(d))
 
+
+    # ========== 3.5 Attach precomputed reference logps ==========
+    REF_LOGPS_PATH = os.environ.get("REF_LOGPS_PATH", "/workspace/ref_logps.pt")
+    logger.info("Loading precomputed ref logps from %s", REF_LOGPS_PATH)
+    ref_logps = torch.load(REF_LOGPS_PATH)
+
+    for split_name in list(ds.keys()):
+        split_ds = ds[split_name]
+        assert len(split_ds) == len(ref_logps[split_name]["chosen"]), (
+            f"Precompute/dataset size mismatch for {split_name}: "
+            f"dataset has {len(split_ds)}, ref file has {len(ref_logps[split_name]['chosen'])}. "
+            "Did filtering differ between precompute and training?"
+        )
+        split_ds = split_ds.add_column("ref_chosen_logp",   ref_logps[split_name]["chosen"])
+        split_ds = split_ds.add_column("ref_rejected_logp", ref_logps[split_name]["rejected"])
+        ds[split_name] = split_ds
+        logger.info("  %s: attached %d ref logp pairs", split_name, len(split_ds))
+
     # ========================== 4. Collator ==========================
     collator = SpokenSwagMoshiCollator(
         mimi_model=mimi,

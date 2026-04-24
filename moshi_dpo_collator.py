@@ -359,6 +359,15 @@ class SpokenSwagMoshiCollator:
         for key, val in rejected_out.items():
             batch[f"rejected_{key}"] = val
 
+        # Pass precomputed reference logps through, if present.
+        if "ref_chosen_logp" in features[0]:
+            batch["ref_chosen_logp"] = torch.tensor(
+                [f["ref_chosen_logp"] for f in features], dtype=torch.float32,
+            )
+            batch["ref_rejected_logp"] = torch.tensor(
+                [f["ref_rejected_logp"] for f in features], dtype=torch.float32,
+            )
+
         return batch
 
     

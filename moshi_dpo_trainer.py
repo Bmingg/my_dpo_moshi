@@ -65,6 +65,66 @@ def _build_audio_completion_mask(completion_mask: torch.Tensor, num_codebooks: i
     return out.to(torch.float32)
 
 
+def compute_side_logps(
+    model,
+    moshi_codes: torch.Tensor,
+    user_codes: torch.Tensor,
+    text_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    completion_mask: torch.Tensor,
+    audio_bos: int,
+    semantic_loss_weight: float = 7.0,
+    acoustic_loss_weight: float = 1.0,
+    text_loss_weight: float = 1.0,
+    use_text_alignment: bool = False,
+) -> torch.Tensor:
+    """
+    Per-example log-prob of the completion. Shape [B].
+
+    This is the single source of truth for how Moshi DPO log-probs are
+    computed. Both MoshiDPOTrainer and precompute_ref_logps.py call it.
+    """
+    B, K, T = moshi_codes.shape
+
+    outputs = model(
+        input_ids=text_ids,
+        attention_mask=attention_mask,
+        user_audio_codes=user_codes,
+        moshi_audio_codes=moshi_codes,
+        text_labels=text_ids,
+        audio_labels=moshi_codes,
+        return_dict=True,
+    )
+    text_logits = outputs.logits
+    V_audio = outputs.audio_logits.shape[-1]
+    audio_logits = outputs.audio_logits.view(B, T, K, V_audio)
+
+    # Text CE (position-shifted)
+    text_logp_per_pos = _gather_text_logp(text_logits, text_ids)
+
+    # Audio CE (delay-pattern shift)
+    delayed_codes = _apply_delay_pattern(moshi_codes, audio_bos)
+    audio_logp_per_pos = _gather_audio_logp(audio_logits, delayed_codes)
+
+    # Per-codebook weighting
+    codebook_weights = torch.tensor(
+        [semantic_loss_weight] + [acoustic_loss_weight] * (K - 1),
+        device=audio_logp_per_pos.device,
+        dtype=audio_logp_per_pos.dtype,
+    )
+    audio_logp_weighted = audio_logp_per_pos * codebook_weights
+
+    # Mask to completion region
+    text_mask = completion_mask[:, 1:].to(text_logp_per_pos.dtype)
+    text_logp = (text_logp_per_pos * text_mask).sum(dim=-1)
+
+    audio_mask = _build_audio_completion_mask(completion_mask, K).to(audio_logp_weighted.dtype)
+    audio_logp = (audio_logp_weighted * audio_mask).sum(dim=(1, 2))
+
+    if use_text_alignment:
+        return text_loss_weight * text_logp + audio_logp
+    return audio_logp
+
 # ============================================================
 # Trainer
 # ============================================================
@@ -98,15 +158,15 @@ class MoshiDPOTrainer(Trainer):
         frozen_count = sum(p.numel() for p in mimi.parameters())
         logger.info("Mimi encoder frozen (%d params)", frozen_count)
 
-        # ---- Create reference model ----
-        if ref_model is None:
-            logger.info("Creating reference model (deepcopy)...")
-            ref_model = copy.deepcopy(model)
-            ref_model.gradient_checkpointing_disable()
-            for param in ref_model.parameters():
-                param.requires_grad = False
-        ref_model.eval()
-        self._ref_model = ref_model  # stored before super().__init__
+        # # ---- Create reference model ----
+        # if ref_model is None:
+        #     logger.info("Creating reference model (deepcopy)...")
+        #     ref_model = copy.deepcopy(model)
+        #     ref_model.gradient_checkpointing_disable()
+        #     for param in ref_model.parameters():
+        #         param.requires_grad = False
+        # ref_model.eval()
+        # self._ref_model = ref_model  # stored before super().__init__
 
         # ---- DPO config ----
         self.beta = beta
@@ -131,7 +191,7 @@ class MoshiDPOTrainer(Trainer):
         )
 
         # ---- Prepare ref model for device placement ----
-        self._ref_model = self.accelerator.prepare_model(self._ref_model, evaluation_mode=True)
+        # self._ref_model = self.accelerator.prepare_model(self._ref_model, evaluation_mode=True)
 
         # Log param counts
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -167,59 +227,78 @@ class MoshiDPOTrainer(Trainer):
     # Side log-probs (unchanged from original)
     # ============================================================
 
+    # def _side_logps(
+    #     self,
+    #     model,
+    #     moshi_codes: torch.Tensor,
+    #     user_codes: torch.Tensor,
+    #     text_ids: torch.Tensor,
+    #     attention_mask: torch.Tensor | None,
+    #     completion_mask: torch.Tensor,
+    #     audio_bos: int,
+    # ) -> torch.Tensor:
+    #     """Return per-example log-prob of the completion, shape [B]."""
+    #     B, K, T = moshi_codes.shape
+
+        # outputs = model(
+        #     input_ids=text_ids,
+        #     attention_mask=attention_mask,
+        #     user_audio_codes=user_codes,
+        #     moshi_audio_codes=moshi_codes,
+        #     text_labels=text_ids,
+        #     audio_labels=moshi_codes,
+        #     return_dict=True,
+        # )
+        # text_logits = outputs.logits
+        # audio_logits = outputs.audio_logits
+        # V_audio = audio_logits.shape[-1]
+        # audio_logits = audio_logits.view(B, T, K, V_audio)
+
+        # # Text log-probs
+        # text_logp_per_pos = _gather_text_logp(text_logits, text_ids)
+
+        # # Audio log-probs with delay pattern
+        # delayed_codes = _apply_delay_pattern(moshi_codes, audio_bos)
+        # audio_logp_per_pos = _gather_audio_logp(audio_logits, delayed_codes)
+
+        # # Codebook weights
+        # codebook_weights = torch.tensor(
+        #     [self.semantic_loss_weight] + [self.acoustic_loss_weight] * (K - 1),
+        #     device=audio_logp_per_pos.device, dtype=audio_logp_per_pos.dtype,
+        # )
+        # audio_logp_weighted = audio_logp_per_pos * codebook_weights
+
+        # # Text completion mask
+        # text_mask = completion_mask[:, 1:].to(text_logp_per_pos.dtype)
+        # text_logp = (text_logp_per_pos * text_mask).sum(dim=-1)
+
+        # # Audio completion mask
+        # audio_mask = _build_audio_completion_mask(completion_mask, K).to(audio_logp_weighted.dtype)
+        # audio_logp = (audio_logp_weighted * audio_mask).sum(dim=(1, 2))
+
+        # # Combine
+        # if self.use_text_alignment:
+        #     return self.text_loss_weight * text_logp + audio_logp
+        # return audio_logp
     def _side_logps(
         self,
         model,
-        moshi_codes: torch.Tensor,
-        user_codes: torch.Tensor,
-        text_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        completion_mask: torch.Tensor,
-        audio_bos: int,
-    ) -> torch.Tensor:
-        """Return per-example log-prob of the completion, shape [B]."""
-        B, K, T = moshi_codes.shape
-
-        outputs = model(
-            input_ids=text_ids,
+        moshi_codes, user_codes, text_ids,
+        attention_mask, completion_mask, audio_bos,
+    ):
+        return compute_side_logps(
+            model=model,
+            moshi_codes=moshi_codes,
+            user_codes=user_codes,
+            text_ids=text_ids,
             attention_mask=attention_mask,
-            user_audio_codes=user_codes,
-            moshi_audio_codes=moshi_codes,
-            text_labels=text_ids,
-            audio_labels=moshi_codes,
-            return_dict=True,
+            completion_mask=completion_mask,
+            audio_bos=audio_bos,
+            semantic_loss_weight=self.semantic_loss_weight,
+            acoustic_loss_weight=self.acoustic_loss_weight,
+            text_loss_weight=self.text_loss_weight,
+            use_text_alignment=self.use_text_alignment,
         )
-        text_logits = outputs.logits
-        audio_logits = outputs.audio_logits
-        V_audio = audio_logits.shape[-1]
-        audio_logits = audio_logits.view(B, T, K, V_audio)
-
-        # Text log-probs
-        text_logp_per_pos = _gather_text_logp(text_logits, text_ids)
-
-        # Audio log-probs with delay pattern
-        delayed_codes = _apply_delay_pattern(moshi_codes, audio_bos)
-        audio_logp_per_pos = _gather_audio_logp(audio_logits, delayed_codes)
-
-        # Codebook weights
-        codebook_weights = torch.tensor(
-            [self.semantic_loss_weight] + [self.acoustic_loss_weight] * (K - 1),
-            device=audio_logp_per_pos.device, dtype=audio_logp_per_pos.dtype,
-        )
-        audio_logp_weighted = audio_logp_per_pos * codebook_weights
-
-        # Text completion mask
-        text_mask = completion_mask[:, 1:].to(text_logp_per_pos.dtype)
-        text_logp = (text_logp_per_pos * text_mask).sum(dim=-1)
-
-        # Audio completion mask
-        audio_mask = _build_audio_completion_mask(completion_mask, K).to(audio_logp_weighted.dtype)
-        audio_logp = (audio_logp_weighted * audio_mask).sum(dim=(1, 2))
-
-        # Combine
-        if self.use_text_alignment:
-            return self.text_loss_weight * text_logp + audio_logp
-        return audio_logp
 
     # ============================================================
     # compute_loss — the DPO loss
@@ -240,6 +319,11 @@ class MoshiDPOTrainer(Trainer):
             completion_mask=inputs["chosen_completion_mask"],
             audio_bos=audio_bos,
         )
+        if self.state.global_step == 0 and model.training:
+            ref_c = inputs["ref_chosen_logp"].to(chosen_logps.device).to(chosen_logps.dtype)
+            diff = (chosen_logps - ref_c).abs().max().item()
+            logger.info("Step 0 sanity: |policy_logp - ref_logp|_max = %.4e", diff)
+            # Should be < ~1e-2 for bf16. Larger diff means precompute/train mismatch.
         rejected_logps = self._side_logps(
             model,
             moshi_codes=inputs["rejected_moshi_audio_codes"],
@@ -250,26 +334,28 @@ class MoshiDPOTrainer(Trainer):
             audio_bos=audio_bos,
         )
 
-        # ---- Reference log-probs ----
-        with torch.no_grad():
-            ref_chosen_logps = self._side_logps(
-                self._ref_model,
-                moshi_codes=inputs["chosen_moshi_audio_codes"],
-                user_codes=inputs["chosen_user_audio_codes"],
-                text_ids=inputs["chosen_input_ids"],
-                attention_mask=inputs.get("chosen_attention_mask"),
-                completion_mask=inputs["chosen_completion_mask"],
-                audio_bos=audio_bos,
-            )
-            ref_rejected_logps = self._side_logps(
-                self._ref_model,
-                moshi_codes=inputs["rejected_moshi_audio_codes"],
-                user_codes=inputs["rejected_user_audio_codes"],
-                text_ids=inputs["rejected_input_ids"],
-                attention_mask=inputs.get("rejected_attention_mask"),
-                completion_mask=inputs["rejected_completion_mask"],
-                audio_bos=audio_bos,
-            )
+        # # ---- Reference log-probs ----
+        # with torch.no_grad():
+        #     ref_chosen_logps = self._side_logps(
+        #         self._ref_model,
+        #         moshi_codes=inputs["chosen_moshi_audio_codes"],
+        #         user_codes=inputs["chosen_user_audio_codes"],
+        #         text_ids=inputs["chosen_input_ids"],
+        #         attention_mask=inputs.get("chosen_attention_mask"),
+        #         completion_mask=inputs["chosen_completion_mask"],
+        #         audio_bos=audio_bos,
+        #     )
+        #     ref_rejected_logps = self._side_logps(
+        #         self._ref_model,
+        #         moshi_codes=inputs["rejected_moshi_audio_codes"],
+        #         user_codes=inputs["rejected_user_audio_codes"],
+        #         text_ids=inputs["rejected_input_ids"],
+        #         attention_mask=inputs.get("rejected_attention_mask"),
+        #         completion_mask=inputs["rejected_completion_mask"],
+        #         audio_bos=audio_bos,
+        #     )
+        ref_chosen_logps   = inputs["ref_chosen_logp"].to(chosen_logps.device)
+        ref_rejected_logps = inputs["ref_rejected_logp"].to(rejected_logps.device)
 
         # ---- DPO loss (sigmoid) ----
         chosen_rewards = self.beta * (chosen_logps - ref_chosen_logps)
