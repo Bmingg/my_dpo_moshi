@@ -14,11 +14,6 @@ Produces three new columns per example:
 These plug directly into SpokenSwagMoshiCollator(use_text_alignment=True).
 
 Usage:
-  # Smoke test (10 examples, local GPU)
-  python preprocess_spoken_swag.py \
-      --hf_push_repo your-username/SpokenSwag-aligned \
-      --train_take 10 --val_take 10
-
   # Full run (takes ~12-24h on a single GPU depending on whisper model)
   python preprocess_spoken_swag.py \
       --hf_push_repo your-username/SpokenSwag-aligned \

@@ -5,9 +5,6 @@ Usage:
   # Full run (detached — keeps running after you close terminal)
   modal run --detach infra/modal_app.py
 
-  # With custom args forwarded to run_moshi_dpo.py
-  modal run --detach infra/modal_app.py --max-steps 500
-
   # Interactive (logs stream to terminal, dies if you disconnect)
   modal run infra/modal_app.py
 """
@@ -26,10 +23,16 @@ APP_NAME = "moshi-dpo"
 PROJECT_DIR = "/root/project"
 VOLUME_PATH = "/vol"
 
-DEFAULT_GPU = "H200"
+# GPU configuration — overridable via env vars at launch time.
+#   MODAL_NUM_GPUS=2 modal run --detach infra/modal_app.py
+#   MODAL_GPU_TYPE=B200 MODAL_NUM_GPUS=4 modal run --detach infra/modal_app.py
+MODAL_GPU_TYPE = os.environ.get("MODAL_GPU_TYPE", "H200")
+NPROC_PER_NODE = int(os.environ.get("MODAL_NUM_GPUS", "4"))
+
+DEFAULT_GPU = f"{MODAL_GPU_TYPE}:{NPROC_PER_NODE}" if NPROC_PER_NODE > 1 else MODAL_GPU_TYPE
 DEFAULT_CPU = 4.0
-DEFAULT_MEMORY_MB = 81920           # 80 GB — Moshi 7B + LoRA needs headroom
-DEFAULT_TIMEOUT_SECONDS = 60 * 60 * 24  # 24h
+DEFAULT_MEMORY_MB = 81920
+DEFAULT_TIMEOUT_SECONDS = 60 * 60 * 24 # 24 hours
 
 # Volume commits every 5 min so you don't lose checkpoints on crash.
 DEFAULT_VOLUME_COMMIT_INTERVAL_SECONDS = 300
@@ -126,6 +129,7 @@ image = image.run_commands(
     "bitsandbytes "       # 8-bit Adam, fallback if switching to H100
     "wandb "              # real-time metric dashboard
     "torchcodec "         # audio decoding for HF datasets
+    "peft "
 )
 
 # Copy HF credentials so we can push/pull private repos.
@@ -167,6 +171,7 @@ SWEEP_ENV_VARS = [
     "MOSHI_DPO_EPOCHS", "MOSHI_DPO_MAX_STEPS", "MOSHI_DPO_BATCH_SIZE",
     "MOSHI_DPO_GRAD_ACCUM", "MOSHI_DPO_TRAIN_TAKE", "MOSHI_DPO_VAL_TAKE",
     "MOSHI_DPO_OUTPUT_DIR", "MOSHI_DPO_REPORT_TO",
+    "MAX_PROMPT_SEC", "MAX_COMPLETION_SEC", "WANDB_PROJECT", "WANDB_NAME",
 ]
 for var in SWEEP_ENV_VARS:
     if os.environ.get(var):
@@ -195,23 +200,63 @@ for secret_var in ("WANDB_API_KEY", "HF_TOKEN"):
     memory=DEFAULT_MEMORY_MB,
 )
 def train_remote() -> None:
-    """Run Moshi DPO training on a remote H100."""
+    """Run Moshi DPO training with torchrun (DDP if NPROC_PER_NODE > 1)."""
     cmd = [
-        "python", "-u",
+        "torchrun",
+        f"--nproc_per_node={NPROC_PER_NODE}",
+        "--standalone",
         f"{PROJECT_DIR}/run_dpo_moshi.py",
     ]
-
     print(f"[modal] Running: {' '.join(cmd)}")
     print(f"[modal] Checkpoints → {VOLUME_PATH}/moshi-dpo-checkpoints")
     _run_subprocess_with_periodic_volume_commits(cmd)
 
+@app.function(
+    image=image,
+    cpu=4.0,
+    memory=24576,    # 24 GB system RAM, no GPU
+    timeout=600,
+)
+def inspect_modules():
+    """One-off: dump checkpointed module names. No GPU, no training."""
+    import torch
+    from transformers import MoshiForConditionalGeneration
+    
+    model = MoshiForConditionalGeneration.from_pretrained(
+        "kmhf/hf-moshiko",
+        torch_dtype=torch.bfloat16,
+    )
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    
+    print("=== Checkpointed modules ===")
+    ckpt = [(n, type(m).__name__) for n, m in model.named_modules()
+            if getattr(m, "gradient_checkpointing", False)]
+    print(f"Total: {len(ckpt)}")
+    for name, cls in ckpt[:30]:
+        print(f"  {name}  ({cls})")
+    if len(ckpt) > 30:
+        print(f"  ... and {len(ckpt) - 30} more")
+    
+    print("\n=== Depth-related modules ===")
+    for n, m in model.named_modules():
+        if "depth" in n.lower() or "depformer" in n.lower():
+            flag = getattr(m, "gradient_checkpointing", "N/A")
+            print(f"  {n}  ({type(m).__name__})  ckpt={flag}")
+    
+    print("\n=== Top-level structure ===")
+    print(type(model).__name__)
+    for name, child in model.named_children():
+        print(f"  {name}: {type(child).__name__}")
 
 # ========================== entrypoint ==========================
 
 @app.local_entrypoint()
 def main() -> None:
     """Default entrypoint: launch training on Modal."""
-    print(f"[modal] Launching {APP_NAME} on {DEFAULT_GPU}...")
-    print(f"[modal] Volume: moshi-dpo-volume (mounted at {VOLUME_PATH})")
-    print(f"[modal] Timeout: {DEFAULT_TIMEOUT_SECONDS // 3600}h")
+    print(f"[modal] Launching {APP_NAME}")
+    print(f"[modal]   GPU spec: {DEFAULT_GPU}  ({NPROC_PER_NODE} GPU{'s' if NPROC_PER_NODE > 1 else ''})")
+    print(f"[modal]   Volume: moshi-dpo-volume (mounted at {VOLUME_PATH})")
+    print(f"[modal]   Timeout: {DEFAULT_TIMEOUT_SECONDS // 3600}h")
     train_remote.remote()

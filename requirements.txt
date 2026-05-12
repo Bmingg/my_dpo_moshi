@@ -12,3 +12,4 @@ wandb
 joblib
 trl
 scikit-learn
+peft

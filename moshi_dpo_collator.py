@@ -148,7 +148,6 @@ class SpokenSwagMoshiCollator:
          (`*_input_ids`, `*_user_input_values`, `*_moshi_input_values`,
          `*_attention_mask`) so that `concatenated_forward` can stack them.
 
-    None of (a)-(d) is implemented here — they are TODOs for the user.
     """
     mimi_model: Any
     sampling_rate: int = 24000
@@ -240,6 +239,7 @@ class SpokenSwagMoshiCollator:
         prompt_audio: list[np.ndarray],
         completion_audio: list[np.ndarray],
         input_ids_list: list[list[int]],
+        silence_codes: torch.LongTensor,  # [1, K, T_silence], precomputed in __call__
     ) -> dict:
         prompt_frames     = [len(a) // MIMI_HOP_LENGTH for a in prompt_audio]
         completion_frames = [len(a) // MIMI_HOP_LENGTH for a in completion_audio]
@@ -253,9 +253,8 @@ class SpokenSwagMoshiCollator:
 
         moshi_codes = self._encode_mimi(concat_audio)
         moshi_codes = moshi_codes[:, :, :max_frames]
-
-        user_codes = torch.zeros_like(moshi_codes)
-
+        user_codes = silence_codes.expand(moshi_codes.shape[0], -1, -1)[:, :, :max_frames].contiguous()
+        
         attention_mask = self._make_attention_mask(total_frames, max_frames)
 
         completion_mask = self._make_completion_mask(
@@ -282,40 +281,20 @@ class SpokenSwagMoshiCollator:
         }
         
     def __call__(self, features: list[dict]) -> dict:
-        # TODO(user): implement the (a)-(d) pipeline above.
-        #
-        # A minimal sketch (not enough for real training, but enough to see
-        # the shape) would look like:
-        #
-        #     prompt_audio = [f["prompt"]["array"] for f in features]
-        #     chosen_audio = [f["chosen"]["array"] for f in features]
-        #     rejected_audio = [f["rejected"]["array"] for f in features]
-        #
-        #     prompt_iv = self.feature_extractor(
-        #         raw_audio=prompt_audio,
-        #         sampling_rate=self.sampling_rate,
-        #         return_tensors="pt",
-        #         padding=True,
-        #     )
-        #     chosen_iv = self.feature_extractor(...)
-        #     rejected_iv = self.feature_extractor(...)
-        #
-        #     prompt_text_ids = self.tokenizer(
-        #         [f["prompt_text"] for f in features],
-        #         return_tensors="pt", padding=True,
-        #     )
-        #
-        #     return {
-        #         "prompt_input_ids":         prompt_text_ids.input_ids,
-        #         "prompt_user_input_values": prompt_iv.input_values,
-        #         "chosen_moshi_input_values":   chosen_iv.input_values,
-        #         "rejected_moshi_input_values": rejected_iv.input_values,
-        #         ...
-        #     }
         prompt_audio, chosen_audio, rejected_audio = self._truncate_audio(features)
         prompt_frames   = [len(a) // MIMI_HOP_LENGTH for a in prompt_audio]
         chosen_frames   = [len(a) // MIMI_HOP_LENGTH for a in chosen_audio]
         rejected_frames = [len(a) // MIMI_HOP_LENGTH for a in rejected_audio]
+
+        # Encode silence once for the whole batch — used by both chosen and rejected sides.
+        # Length must cover the longer of the two sides.
+        max_total_audio_len = max(
+            max(len(p) + len(c) for p, c in zip(prompt_audio, chosen_audio)),
+            max(len(p) + len(c) for p, c in zip(prompt_audio, rejected_audio)),
+        )
+        silence_waveform = np.zeros(max_total_audio_len, dtype=np.float32)
+        silence_codes = self._encode_mimi([silence_waveform])  # [1, K, T_silence]
+
 
         if self.use_text_alignment:
             for key in (
@@ -350,23 +329,24 @@ class SpokenSwagMoshiCollator:
                 for i in range(len(features))
             ]
 
-        chosen_out   = self._build_side(prompt_audio, chosen_audio,   chosen_ids)
-        rejected_out = self._build_side(prompt_audio, rejected_audio, rejected_ids)
+        chosen_out   = self._build_side(prompt_audio, chosen_audio, chosen_ids, silence_codes)
+        rejected_out = self._build_side(prompt_audio, rejected_audio, rejected_ids, silence_codes)
 
         batch = {}
         for key, val in chosen_out.items():
             batch[f"chosen_{key}"] = val
         for key, val in rejected_out.items():
             batch[f"rejected_{key}"] = val
-
-        # Pass precomputed reference logps through, if present.
-        if "ref_chosen_logp" in features[0]:
-            batch["ref_chosen_logp"] = torch.tensor(
-                [f["ref_chosen_logp"] for f in features], dtype=torch.float32,
-            )
-            batch["ref_rejected_logp"] = torch.tensor(
-                [f["ref_rejected_logp"] for f in features], dtype=torch.float32,
-            )
+        
+        # No longer precomputing ref logps — compute on the fly inside the trainer's compute_loss
+        # # Pass precomputed reference logps through, if present.
+        # if "ref_chosen_logp" in features[0]:
+        #     batch["ref_chosen_logp"] = torch.tensor(
+        #         [f["ref_chosen_logp"] for f in features], dtype=torch.float32,
+        #     )
+        #     batch["ref_rejected_logp"] = torch.tensor(
+        #         [f["ref_rejected_logp"] for f in features], dtype=torch.float32,
+        #     )
 
         return batch
 

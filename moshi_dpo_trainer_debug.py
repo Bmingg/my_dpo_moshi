@@ -18,8 +18,6 @@ import torch
 import torch.nn.functional as F
 from transformers import Trainer
 import os
-import copy
-
 
 logger = logging.getLogger(__name__)
 
@@ -66,16 +64,6 @@ def _build_audio_completion_mask(completion_mask: torch.Tensor, num_codebooks: i
     return out.to(torch.float32)
 
 
-def _mem(label: str):
-    torch.cuda.synchronize()
-    print(
-        f"[MEM] {label}: "
-        f"alloc={torch.cuda.memory_allocated()/1e9:.2f} GB | "
-        f"reserved={torch.cuda.memory_reserved()/1e9:.2f} GB | "
-        f"peak={torch.cuda.max_memory_allocated()/1e9:.2f} GB",
-        flush=True,
-    )
-
 def compute_side_logps(
     model,
     moshi_codes: torch.Tensor,
@@ -96,6 +84,7 @@ def compute_side_logps(
     computed. Both MoshiDPOTrainer and precompute_ref_logps.py call it.
     """
     B, K, T = moshi_codes.shape
+
     outputs = model(
         input_ids=text_ids,
         attention_mask=attention_mask,
@@ -105,18 +94,14 @@ def compute_side_logps(
         audio_labels=moshi_codes,
         return_dict=True,
     )
-    _mem("after model forward")
-    # print(
-    #     f"[OUT] logits={tuple(outputs.logits.shape)} {outputs.logits.dtype} | "
-    #     f"audio_logits={tuple(outputs.audio_logits.shape)} {outputs.audio_logits.dtype}",
-    #     flush=True,
-    # )
-
     text_logits = outputs.logits
-
     V_audio = outputs.audio_logits.shape[-1]
     audio_logits = outputs.audio_logits.view(B, T, K, V_audio)
+
+    # Text CE (position-shifted)
     text_logp_per_pos = _gather_text_logp(text_logits, text_ids)
+
+    # Audio CE (delay-pattern shift)
     delayed_codes = _apply_delay_pattern(moshi_codes, audio_bos)
     audio_logp_per_pos = _gather_audio_logp(audio_logits, delayed_codes)
 
@@ -128,25 +113,9 @@ def compute_side_logps(
     )
     audio_logp_weighted = audio_logp_per_pos * codebook_weights
 
-    if use_text_alignment:
-        text_logp_per_pos = _gather_text_logp(text_logits, text_ids)  # [B, T-1]
-        
-        # Down-weight PAD frames, matching Kyutai's text_padding_weight=0.5
-        text_pad_id = 3  # MOSHI_TEXT_PAD_ID
-        shifted_targets = text_ids[:, 1:]
-        pad_mask = (shifted_targets == text_pad_id)
-        pad_weights = torch.where(
-            pad_mask,
-            torch.tensor(0.5, device=text_logp_per_pos.device, dtype=text_logp_per_pos.dtype),
-            torch.tensor(1.0, device=text_logp_per_pos.device, dtype=text_logp_per_pos.dtype),
-        )
-        
-        text_mask = completion_mask[:, 1:].to(text_logp_per_pos.dtype)
-        text_logp = (text_logp_per_pos * pad_weights * text_mask).sum(dim=-1)
-    else:
-        # Mask to completion region
-        text_mask = completion_mask[:, 1:].to(text_logp_per_pos.dtype)
-        text_logp = (text_logp_per_pos * text_mask).sum(dim=-1)
+    # Mask to completion region
+    text_mask = completion_mask[:, 1:].to(text_logp_per_pos.dtype)
+    text_logp = (text_logp_per_pos * text_mask).sum(dim=-1)
 
     audio_mask = _build_audio_completion_mask(completion_mask, K).to(audio_logp_weighted.dtype)
     audio_logp = (audio_logp_weighted * audio_mask).sum(dim=(1, 2))
@@ -186,29 +155,15 @@ class MoshiDPOTrainer(Trainer):
         frozen_count = sum(p.numel() for p in mimi.parameters())
         logger.info("Mimi encoder frozen (%d params)", frozen_count)
 
-        if not use_text_alignment:
-            if hasattr(model.decoder, "lm_head"):
-                model.decoder.lm_head.eval()
-                for p in model.decoder.lm_head.parameters():
-                    p.requires_grad_(False)
-            
-            lm_head_trainable = sum(
-                p.numel() for p in model.decoder.lm_head.parameters()
-                if p.requires_grad
-            )
-            logger.info("decoder.lm_head frozen: trainable=%d", lm_head_trainable)
-            assert lm_head_trainable == 0
-
-        # ---- Create reference model ----
-        if ref_model is None:
-            logger.info("Creating reference model (deepcopy)...")
-            ref_model = copy.deepcopy(model)
-        if hasattr(ref_model, "gradient_checkpointing_disable"):
-            ref_model.gradient_checkpointing_disable()
-        for param in ref_model.parameters():
-            param.requires_grad = False
-        ref_model.eval()
-        self._ref_model = ref_model  # stored before super().__init__
+        # # ---- Create reference model ----
+        # if ref_model is None:
+        #     logger.info("Creating reference model (deepcopy)...")
+        #     ref_model = copy.deepcopy(model)
+        #     ref_model.gradient_checkpointing_disable()
+        #     for param in ref_model.parameters():
+        #         param.requires_grad = False
+        # ref_model.eval()
+        # self._ref_model = ref_model  # stored before super().__init__
 
         # ---- DPO config ----
         self.beta = beta
@@ -233,7 +188,7 @@ class MoshiDPOTrainer(Trainer):
         )
 
         # ---- Prepare ref model for device placement ----
-        self._ref_model = self.accelerator.prepare_model(self._ref_model, evaluation_mode=True)
+        # self._ref_model = self.accelerator.prepare_model(self._ref_model, evaluation_mode=True)
 
         # Log param counts
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -256,7 +211,7 @@ class MoshiDPOTrainer(Trainer):
             return self.audio_bos_token_id
         # Unwrap accelerate/FSDP wrappers
         m = model.module if hasattr(model, "module") else model        # unwrap DDP
-        # m = m.base_model.model if hasattr(m, "base_model") else m     # unwrap PEFT LoRA
+        m = m.base_model.model if hasattr(m, "base_model") else m     # unwrap PEFT LoRA
         v = getattr(m.config, "audio_vocab_size", None)
         if v is None and hasattr(m.config, "depth_decoder_config"):
             v = getattr(m.config.depth_decoder_config, "audio_vocab_size", None)
@@ -292,7 +247,24 @@ class MoshiDPOTrainer(Trainer):
         """Compute DPO sigmoid loss over Moshi audio log-probs."""
         audio_bos = self._resolve_audio_bos(model)
         mode = "train" if model.training else "eval"
-                
+
+        # ===== diagnostic on step 0 =====
+        # rank = int(os.environ.get("LOCAL_RANK", 0))
+        is_step_0 = self.state.global_step == 0
+        
+        def _mem(label):
+            if is_step_0:
+                torch.cuda.synchronize()
+                alloc = torch.cuda.memory_allocated() / 1e9
+                peak = torch.cuda.max_memory_allocated() / 1e9
+                reserved = torch.cuda.memory_reserved() / 1e9
+                logger.info(
+                    "MEM[%s] alloc=%.1fGB peak=%.1fGB reserved=%.1fGB",
+                    label, alloc, peak, reserved,
+                )
+        
+        _mem("compute_loss_start")
+        
         # ---- Policy log-probs ----
         chosen_logps = self._side_logps(
             model,
@@ -303,7 +275,22 @@ class MoshiDPOTrainer(Trainer):
             completion_mask=inputs["chosen_completion_mask"],
             audio_bos=audio_bos,
         )
-
+        _mem("after_chosen_forward")
+        # if self.state.global_step == 0 and model.training:
+        #     ref_c = inputs["ref_chosen_logp"].to(chosen_logps.device).to(chosen_logps.dtype)
+        #     diff = (chosen_logps - ref_c).abs().max().item()
+        #     logger.info("Step 0 sanity: |policy_logp - ref_logp|_max = %.4e", diff)
+        #     # Should be < ~1e-2 for bf16. Larger diff means precompute/train mismatch.
+        
+        if self.state.global_step == 0 and model.training:
+            is_main = int(os.environ.get("LOCAL_RANK", 0)) == 0
+            ref_c = inputs["ref_chosen_logp"].to(chosen_logps.device).to(chosen_logps.dtype)
+            diff = (chosen_logps - ref_c).abs().max().item()
+            if is_main:
+                logger.info(
+                    "Step 0 sanity (rank 0 batch): |policy - ref|_max = %.4e. "
+                    "Should be ~1e-3 in bf16.", diff,
+                )
 
         rejected_logps = self._side_logps(
             model,
@@ -315,40 +302,10 @@ class MoshiDPOTrainer(Trainer):
             audio_bos=audio_bos,
         )
 
-        # ref_chosen_logps = inputs["ref_chosen_logp"].to(chosen_logps.device)
-        # ref_rejected_logps = inputs["ref_rejected_logp"].to(rejected_logps.device)
+        _mem("after_rejected_forward")
 
-        with torch.no_grad():
-            ref_chosen_logps = self._side_logps(
-                self._ref_model,
-                moshi_codes=inputs["chosen_moshi_audio_codes"],
-                user_codes=inputs["chosen_user_audio_codes"],
-                text_ids=inputs["chosen_input_ids"],
-                attention_mask=inputs.get("chosen_attention_mask"),
-                completion_mask=inputs["chosen_completion_mask"],
-                audio_bos=audio_bos,
-            )
-            ref_rejected_logps = self._side_logps(
-                self._ref_model,
-                moshi_codes=inputs["rejected_moshi_audio_codes"],
-                user_codes=inputs["rejected_user_audio_codes"],
-                text_ids=inputs["rejected_input_ids"],
-                attention_mask=inputs.get("rejected_attention_mask"),
-                completion_mask=inputs["rejected_completion_mask"],
-                audio_bos=audio_bos,
-            )
-        if (
-            self.state.global_step == 0
-            and model.training
-            and not getattr(self, "_did_step0_sanity", False)
-            and int(os.environ.get("LOCAL_RANK", 0)) == 0
-        ):
-            diff = (chosen_logps - ref_chosen_logps).abs().max().item()
-            logger.info(
-                "Step 0 sanity: |policy - ref|_max = %.4e (expected ~1e-3 in bf16)",
-                diff,
-            )
-            self._did_step0_sanity = True
+        ref_chosen_logps = inputs["ref_chosen_logp"].to(chosen_logps.device)
+        ref_rejected_logps = inputs["ref_rejected_logp"].to(rejected_logps.device)
 
         #  DPO loss (sigmoid)
         chosen_rewards = self.beta * (chosen_logps - ref_chosen_logps)
